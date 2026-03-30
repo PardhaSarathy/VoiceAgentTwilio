@@ -23,6 +23,7 @@ except ValueError:
 logger.add(sys.stderr, level="DEBUG")
 
 app = FastAPI()
+app.state.testing = False
 
 app.add_middleware(
     CORSMiddleware,
