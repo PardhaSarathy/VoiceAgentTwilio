@@ -1,5 +1,7 @@
-pipecat-ai[elevenlabs,openai,silero,deepgram]
+pipecat-ai[google,silero]
 fastapi
 uvicorn
 python-dotenv
+python-multipart
 loguru
+twilio
