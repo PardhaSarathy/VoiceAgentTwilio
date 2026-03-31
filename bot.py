@@ -1,3 +1,4 @@
+import asyncio
 import os
 import sys
 
@@ -8,6 +9,7 @@ from loguru import logger
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
+from pipecat.frames.frames import InputTextRawFrame
 from pipecat.serializers.twilio import TwilioFrameSerializer
 from pipecat.services.google.gemini_live import GeminiLiveLLMService
 from pipecat.services.google.gemini_live.llm import GeminiModalities
@@ -90,6 +92,11 @@ async def run_bot(websocket_client: WebSocket, stream_sid: str, testing: bool, c
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
         logger.info(f"[{stream_sid}] Client connected, customer_name={customer_name or 'inbound'}")
+        # Wait for Gemini session to be fully connected
+        while not llm._session:
+            await asyncio.sleep(0.1)
+        logger.info(f"[{stream_sid}] Gemini session ready — triggering greeting")
+        await task.queue_frames([InputTextRawFrame(text="Hello.")])
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):

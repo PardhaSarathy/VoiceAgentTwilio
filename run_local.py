@@ -1,14 +1,14 @@
-"""Run the voice agent locally using your microphone and speakers.
+"""Run the Gemini Live voice agent locally using your microphone and speakers.
 
 Usage:
     python run_local.py
-    python run_local.py --test   # use Deepgram TTS instead of Inworld
 
-Requires: pip install pipecat-ai[local]
+Requires: pip install pipecat-ai[google,local]
 On macOS: brew install portaudio
+
+IMPORTANT: Use headphones for best results to avoid echo-based interruptions.
 """
 
-import argparse
 import asyncio
 import os
 import sys
@@ -16,16 +16,12 @@ import sys
 from dotenv import load_dotenv
 from loguru import logger
 
-from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.audio.vad.vad_analyzer import VADParams
+from pipecat.frames.frames import InputTextRawFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
-from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
-from pipecat.services.deepgram.stt import DeepgramSTTService, LiveOptions
-from pipecat.services.deepgram.tts import DeepgramTTSService
-from pipecat.services.inworld.tts import InworldTTSService
-from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.services.google.gemini_live import GeminiLiveLLMService
+from pipecat.services.google.gemini_live.llm import GeminiModalities, GeminiVADParams
 from pipecat.transports.local.audio import LocalAudioTransport, LocalAudioTransportParams
 
 from prompts import get_system_prompt
@@ -38,85 +34,45 @@ except ValueError:
     pass
 logger.add(sys.stderr, level="DEBUG")
 
-deepgram_api_key = os.getenv("DEEPGRAM_API_KEY")
-openai_api_key = os.getenv("OPENAI_API_KEY")
-inworld_api_key = os.getenv("INWORLD_API_KEY")
+google_api_key = os.getenv("GOOGLE_API_KEY")
 
 
-async def main(testing: bool):
+async def main():
     transport = LocalAudioTransport(
         params=LocalAudioTransportParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
-            vad_enabled=True,
-            vad_analyzer=SileroVADAnalyzer(
-                params=VADParams(
-                    confidence=0.7,
-                    start_secs=0.2,
-                    stop_secs=1.5,
-                    min_volume=0.5,
-                )
-            ),
+            vad_enabled=False,
             vad_audio_passthrough=True,
         ),
     )
 
-    stt = DeepgramSTTService(
-        api_key=deepgram_api_key,
-        live_options=LiveOptions(
-            model="nova-2",
-            language="en",
-            punctuate=True,
-            smart_format=True,
-            interim_results=True,
-            utterance_end_ms="1500",
-            endpointing=300,
-            keywords=["massage", "facial", "spa", "appointment", "booking",
-                      "manicure", "pedicure", "aromatherapy", "scrub", "Ode Spa"],
+    system_prompt = get_system_prompt()
+    system_prompt += "\n\nA caller has just connected. Introduce yourself immediately without waiting for them to speak first."
+
+    llm = GeminiLiveLLMService(
+        api_key=google_api_key,
+        system_instruction=system_prompt,
+        settings=GeminiLiveLLMService.Settings(
+            model="models/gemini-3.1-flash-live-preview",
+            voice="Kore",
+            modalities=GeminiModalities.AUDIO,
+            temperature=0.6,
+            max_tokens=200,
+            vad=GeminiVADParams(
+                start_sensitivity="START_SENSITIVITY_LOW",
+                end_sensitivity="END_SENSITIVITY_LOW",
+                silence_duration_ms=2000,
+                prefix_padding_ms=500,
+            ),
         ),
     )
-
-    llm = OpenAILLMService(
-        api_key=openai_api_key,
-        model="gpt-4o",
-        params=OpenAILLMService.InputParams(
-            temperature=0.7,
-            max_tokens=150,
-        ),
-    )
-
-    if testing:
-        tts = DeepgramTTSService(
-            api_key=deepgram_api_key,
-            voice="aura-asteria-en",
-            sample_rate=24000,
-        )
-    else:
-        tts = InworldTTSService(
-            api_key=inworld_api_key,
-            voice_id="Arjun",
-            model="inworld-tts-1.5-max",
-        )
-
-    messages = [
-        {
-            "role": "system",
-            "content": get_system_prompt(),
-        },
-    ]
-
-    context = OpenAILLMContext(messages)
-    context_aggregator = llm.create_context_aggregator(context)
 
     pipeline = Pipeline(
         [
             transport.input(),
-            stt,
-            context_aggregator.user(),
             llm,
-            tts,
             transport.output(),
-            context_aggregator.assistant(),
         ]
     )
 
@@ -133,11 +89,15 @@ async def main(testing: bool):
         cancel_on_idle_timeout=True,
     )
 
-    @transport.event_handler("on_client_connected")
-    async def on_client_connected(transport, client):
-        logger.info("Local audio connected")
-        messages.append({"role": "system", "content": "Please introduce yourself to the user."})
-        await task.queue_frames([context_aggregator.user().get_context_frame()])
+    @task.event_handler("on_pipeline_started")
+    async def on_pipeline_started(task, frame):
+        # Wait for Gemini session to be fully connected
+        while not llm._session:
+            await asyncio.sleep(0.1)
+        logger.info("Gemini session ready — injecting 'Hello' text to trigger greeting")
+        # InputTextRawFrame goes through the same path as real speech:
+        # process_frame → _send_user_text → send_realtime_input(text=...)
+        await task.queue_frames([InputTextRawFrame(text="Hello.")])
 
     @task.event_handler("on_pipeline_error")
     async def on_pipeline_error(task, error):
@@ -145,16 +105,9 @@ async def main(testing: bool):
 
     runner = PipelineRunner()
 
-    logger.info("Starting local agent — speak into your microphone...")
+    logger.info("Starting local Gemini Live agent — speak into your microphone...")
     await runner.run(task)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run voice agent locally")
-    parser.add_argument(
-        "-t", "--test", action="store_true", default=False,
-        help="use Deepgram TTS instead of Inworld",
-    )
-    args, _ = parser.parse_known_args()
-
-    asyncio.run(main(testing=args.test))
+    asyncio.run(main())
